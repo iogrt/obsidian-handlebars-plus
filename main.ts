@@ -1,134 +1,105 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import * as Handlebars from 'handlebars';
+import { CachedMetadata, debounce, MarkdownPostProcessorContext, MarkdownRenderer, normalizePath, Plugin, TFile, TFolder, Vault } from 'obsidian';
 
-// Remember to rename these classes and interfaces!
-
-interface MyPluginSettings {
-	mySetting: string;
-}
-
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
+type NoteMetadata = Pick<TFile, 'basename' | 'name' | 'path' | 'extension'>
+    & Pick<CachedMetadata, 'frontmatter'>
+    & { json: any };
 
 export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
 
-	async onload() {
-		await this.loadSettings();
+    async onload() {
+        const self_app = this.app;
+        // Returns Note_metadata
+        async function note_record(file: TFile): Promise<NoteMetadata> {
+            const { basename, name, path, extension } = file;
+            const { frontmatter } = self_app.metadataCache.getFileCache(file) ?? {};
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+            // TODO: Allow path overriding from frontmatter property
+            const jasonFile = self_app.vault.getFileByPath("data/example.json");
+            const json = await (jasonFile && self_app.vault.cachedRead(jasonFile).then(JSON.parse))
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+            return { basename, name, path, extension, frontmatter, json };
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+        }
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+        interface LinkOptions {
+            path: string;
+            rel?: string;
+            hash?: string;
+            alias?: string;
+        }
+        function link_options(path_or_hash: string | Record<number | string, string>): LinkOptions {
+            if (!path_or_hash) return { path: '' };
+            if (typeof path_or_hash === 'string') {
+                return { path: normalizePath(path_or_hash) }
+            }
+            const { path = '', rel, hash, alias } = path_or_hash;
+            return {
+                path: normalizePath(path),
+                rel,
+                hash,
+                alias: alias !== undefined ? String(alias) : undefined,
+            };
+        }
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
+        Handlebars.registerPartial('link', (path_or_hash, _options) => {
+            const { path, rel, hash, alias } = link_options(path_or_hash);
+            const file = self_app.vault.getAbstractFileByPath(path)
+            if (!(file instanceof TFile)) return '';
+            return self_app.fileManager.generateMarkdownLink(
+                file,
+                rel ? normalizePath(rel) : self_app.vault.getRoot().path,
+                hash,
+                alias
+            );
+        })
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-	}
+        Handlebars.registerHelper('notes', (unsafe_path, options) => {
+            if (!unsafe_path || typeof unsafe_path !== 'string') return [];
+            const result = self_app.vault.getAbstractFileByPath(normalizePath(unsafe_path))
+            if (!result) return [];
+            const files = result instanceof TFolder
+                ? result.children
+                : [result];
+            return files.filter((f): f is TFile => f instanceof TFile)
+                // TODO: Broken now since note record is a promise. rebuild
+                .map((f, index) => options.fn(note_record(f), { data: { ...options.data ?? {}, index } }))
+                .join('');
+        })
 
-	onunload() {
+        Handlebars.registerHelper('show', function (context) {
+            // double code blocks has bad formatting for some reason. cant escape coe block
+            // return "\n```javascript\n" + JSON.stringify(context) + " \n```";
+            return JSON.stringify(context);
+        });
 
-	}
+        const block_handler = debounce(
+            async (source: string, container: HTMLElement, { sourcePath: path }: MarkdownPostProcessorContext) => {
+                console.log("start")
+                const file = self_app.vault.getAbstractFileByPath(path);
+                try {
+                    const template = Handlebars.compile(source, { noEscape: true, strict: true });
+                    const n = await note_record(file as TFile)
+                    await MarkdownRenderer.renderMarkdown(
+                        template(n),
+                        container,
+                        path,
+                        // @ts-ignore: docs say this is optional
+                        undefined,
+                    );
+                } catch (e) {
+                    console.warn(e);
+                }
+                console.log("end")
+            },
+            250,
+        )
+        this.registerMarkdownCodeBlockProcessor(
+            'handlebars',
+            async (source, el, ctx) => block_handler(source, el, ctx)
+        )
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
-
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
-
-	display(): void {
-		const {containerEl} = this;
-
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
+    }
 }
